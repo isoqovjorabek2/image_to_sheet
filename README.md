@@ -68,6 +68,12 @@ This will create an Excel file (`image.xlsx`) in the same directory as the input
   python image_to_sheet.py image.jpg --printed
   ```
 
+- **Use aggressive filtering to remove OCR errors (use only if too much gibberish):**
+  ```bash
+  python image_to_sheet.py image.jpg --aggressive-filter
+  ```
+  Note: By default, the application uses conservative filtering to preserve valid content.
+
 ### Full Command Syntax
 
 ```bash
@@ -79,6 +85,7 @@ Options:
   --no-preprocess          Disable image preprocessing
   --min-confidence FLOAT   Minimum confidence threshold (0.0-1.0, default: 0.2 for handwritten)
   --printed                Use printed text optimization instead of handwritten
+  --aggressive-filter      Use aggressive filtering to remove OCR errors/gibberish (default: conservative)
   -h, --help              Show help message
 ```
 
@@ -191,8 +198,30 @@ This application is **optimized for handwritten text**, especially numbers:
 
 - The application includes automatic number correction
 - Common mistakes are automatically fixed (O→0, I→1, etc.)
+- Aggressive filtering removes OCR gibberish and extracts only valid numbers
 - Check the output Excel file - numbers should be converted to numeric type
 - If numbers are still wrong, the image quality may need improvement
+- Try using `--aggressive-filter` to remove more OCR errors
+
+### Too Many OCR Errors / Gibberish Text
+
+- **Conservative filtering by default** - preserves valid content even with some OCR errors
+- The application cleans text but keeps it unless it's clearly gibberish
+- Cyrillic text is preserved even if it has some OCR errors
+- Numbers are extracted and validated separately
+- If you see too much gibberish, try:
+  - Using `--aggressive-filter` to remove more OCR errors
+  - Improving image quality (higher resolution, better contrast)
+  - Using `--min-confidence 0.25` to filter out low-confidence results
+  - Ensuring good lighting and focus when capturing the image
+
+### Missing Valid Content
+
+- **By default, the application preserves content** - it cleans text but doesn't remove it aggressively
+- If you're missing valid content, the filtering might be too strict
+- Try without `--aggressive-filter` flag (default behavior)
+- Lower the confidence threshold: `--min-confidence 0.15` to capture more text
+- Check that your image has good quality and contrast
 
 ### Cyrillic Text Not Detected Correctly
 

@@ -146,19 +146,37 @@ class ImageToSheetConverter:
             )
         
         # Filter by confidence (lower threshold for handwritten)
-        filtered_results = [
-            (bbox, text, conf) for (bbox, text, conf) in results 
-            if conf >= min_confidence
-        ]
+        # Be more lenient - keep more content
+        filtered_results = []
+        for (bbox, text, conf) in results:
+            # Filter by confidence
+            if conf >= min_confidence:
+                text_clean = text.strip()
+                # Keep text if it has any alphanumeric or Cyrillic content
+                # Be lenient - even single characters might be valid
+                if len(text_clean) >= 1:
+                    # Keep if it has any valid characters
+                    if re.search(r'[a-zA-Zа-яА-ЯёЁ0-9]', text_clean):
+                        filtered_results.append((bbox, text, conf))
+                    # Also keep if it's just digits (numbers)
+                    elif re.search(r'\d', text_clean):
+                        filtered_results.append((bbox, text, conf))
         
         # Post-process text to correct common OCR errors
         processed_results = []
         for (bbox, text, conf) in filtered_results:
-            # Clean numbers in the text
-            cleaned_text = self.post_process_text(text, is_number_column=False)
-            processed_results.append((bbox, cleaned_text, conf))
+            # Clean text (preserve content, just clean it)
+            cleaned_text = self.post_process_text(
+                text, 
+                is_number_column=False,
+                aggressive_filter=False  # Use conservative filtering by default
+            )
+            
+            # Keep text even if it has some OCR errors (better than losing information)
+            if cleaned_text:
+                processed_results.append((bbox, cleaned_text, conf))
         
-        print(f"Found {len(processed_results)} text elements (filtered from {len(results)})")
+        print(f"Found {len(processed_results)} valid text elements (filtered from {len(results)} total)")
         
         return processed_results
     
@@ -269,35 +287,173 @@ class ImageToSheetConverter:
         
         return result
     
-    def post_process_text(self, text: str, is_number_column: bool = False) -> str:
+    def is_gibberish(self, text: str, aggressive: bool = False) -> bool:
         """
-        Post-process OCR text to correct common errors.
+        Check if text appears to be OCR gibberish/errors.
+        More lenient by default to preserve valid content.
+        
+        Args:
+            text: Text to check
+            aggressive: Use more aggressive filtering (removes more, but may remove valid text)
+            
+        Returns:
+            True if text appears to be gibberish
+        """
+        if not text or len(text.strip()) < 1:
+            return False
+        
+        text = text.strip()
+        
+        # Count different character types
+        special_chars = len(re.findall(r'[!@#$%^&*()_+\-=\[\]{};\'\\:"|,.<>?/~`]', text))
+        digits = len(re.findall(r'\d', text))
+        letters = len(re.findall(r'[a-zA-Zа-яА-ЯёЁ]', text))
+        cyrillic_chars = len(re.findall(r'[а-яА-ЯёЁ]', text))
+        total_chars = len(text.replace(' ', ''))
+        
+        if total_chars == 0:
+            return True
+        
+        # If text has substantial Cyrillic content, be very lenient - likely valid
+        if cyrillic_chars >= 3 or (cyrillic_chars > 0 and letters > 0 and cyrillic_chars / letters > 0.2):
+            # Only filter if it's clearly gibberish (very high special char ratio)
+            special_ratio = special_chars / total_chars if total_chars > 0 else 0
+            if special_ratio > 0.6:  # Very high threshold for Cyrillic text
+                return True
+            # Check for obvious patterns like 3+ repeated special chars
+            if re.search(r'[!@#$%^&*()_+\-=\[\]{};\'\\:"|,.<>?/~`]{3,}', text):
+                return True
+            return False
+        
+        # For non-Cyrillic text, use thresholds based on aggressiveness
+        special_ratio = special_chars / total_chars if total_chars > 0 else 0
+        
+        if aggressive:
+            # Aggressive: remove if >30% special chars
+            threshold = 0.3
+        else:
+            # Conservative: only remove if >50% special chars
+            threshold = 0.5
+        
+        # If too many special characters relative to text, likely gibberish
+        if special_ratio > threshold:
+            # But keep if it has substantial letter content
+            if letters >= 3:
+                return False  # Has enough letters, might be valid
+            return True
+        
+        # Check for repeated special characters (obvious gibberish)
+        if re.search(r'[!@#$%^&*()_+\-=\[\]{};\'\\:"|,.<>?/~`]{3,}', text):
+            return True
+        
+        # Very short text with only special chars
+        if len(text) <= 3 and letters == 0 and digits == 0:
+            return True
+        
+        return False
+    
+    def extract_numbers_only(self, text: str) -> Optional[str]:
+        """
+        Extract only valid numbers from text, return None if no valid numbers found.
+        
+        Args:
+            text: Text that may contain numbers
+            
+        Returns:
+            Extracted number string or None
+        """
+        if not text:
+            return None
+        
+        # Remove common OCR artifacts
+        cleaned = text.replace('@', '').replace('#', '').replace('%', '').replace('&', '')
+        
+        # Find number patterns
+        # Look for sequences of digits with optional separators
+        number_patterns = [
+            r'\d+',  # Simple integers
+            r'\d+\.\d+',  # Decimals
+            r'\d+,\d+',  # Decimals with comma
+            r'\d+/\d+',  # Fractions
+            r'\d+-\d+',  # Ranges or dates
+        ]
+        
+        for pattern in number_patterns:
+            matches = re.findall(pattern, cleaned)
+            if matches:
+                # Return the first valid number found
+                num = matches[0]
+                # Clean it up
+                num = num.replace(',', '.').strip()
+                return num
+        
+        return None
+    
+    def post_process_text(self, text: str, is_number_column: bool = False, aggressive_filter: bool = False) -> str:
+        """
+        Post-process OCR text to correct common errors. Cleans text instead of removing it.
         
         Args:
             text: Raw OCR text
             is_number_column: Whether this is likely a number column
+            aggressive_filter: Use aggressive filtering (may remove more content)
             
         Returns:
-            Post-processed text
+            Post-processed text (cleaned but preserved)
         """
         if not text:
-            return text
+            return ''
+        
+        original_text = text
         
         # Remove extra whitespace
         text = ' '.join(text.split())
         
-        # If it's a number column, apply number-specific cleaning
+        # If it's a number column, try to extract numbers
         if is_number_column:
+            number = self.extract_numbers_only(text)
+            if number:
+                return number
+            # If no clean number found, try cleaning but keep the text
             text = self.extract_and_validate_numbers(text)
         
-        # Common character corrections for Cyrillic
-        cyrillic_corrections = {
-            # Common OCR mistakes
-            '0': 'О',  # Zero might be Cyrillic O in some contexts (but we want to keep numbers)
-            # Add more as needed
-        }
+        # Clean up common OCR mistakes in text (but keep the text)
+        # Remove excessive special characters at start/end (but keep some)
+        text = re.sub(r'^[!@#$%^&*()_+\-=\[\]{};\'\\:"|,.<>?/~`]{2,}', '', text)
+        text = re.sub(r'[!@#$%^&*()_+\-=\[\]{};\'\\:"|,.<>?/~`]{2,}$', '', text)
         
-        return text.strip()
+        # Clean up repeated special characters (keep single instances)
+        text = re.sub(r'([!@#$%^&*()_+\-=\[\]{};\'\\:"|,.<>?/~`])\1{2,}', r'\1', text)
+        
+        # Remove isolated single special characters surrounded by spaces (but keep punctuation)
+        text = re.sub(r'\s+[!@#$%^&*()_+\-=\[\]{};\'\\:"|,.<>?/~`]\s+', ' ', text)
+        
+        # Only filter out if it's clearly gibberish (using lenient check)
+        if self.is_gibberish(text, aggressive=aggressive_filter):
+            # Even if gibberish, check if it has any valid content
+            cyrillic_chars = len(re.findall(r'[а-яА-ЯёЁ]', text))
+            letters = len(re.findall(r'[a-zA-Zа-яА-ЯёЁ]', text))
+            digits = len(re.findall(r'\d', text))
+            
+            # Keep if it has substantial content
+            if cyrillic_chars >= 2 or letters >= 3 or digits >= 2:
+                # Has content, clean it but keep it
+                pass
+            elif aggressive_filter:
+                # Only remove if aggressive filtering is enabled AND no content
+                return ''
+            else:
+                # Conservative: keep it even if it looks bad
+                pass
+        
+        # Final cleanup
+        text = text.strip()
+        
+        # Don't return empty unless it's truly empty
+        if not text:
+            return ''
+        
+        return text
     
     def organize_text_into_table(self, ocr_results: List[Tuple]) -> List[List[str]]:
         """
@@ -477,15 +633,30 @@ class ImageToSheetConverter:
         
         # Pad rows to have the same number of columns
         padded_data = []
-        for row in table_data:
+        for row_idx, row in enumerate(table_data):
             # Post-process each cell, especially numbers
             processed_row = []
-            for cell in row:
-                # Check if cell looks like a number
-                is_number = bool(re.search(r'[\dOoIlSsZzGgBb]', cell))
-                cleaned_cell = self.post_process_text(cell, is_number_column=is_number)
+            for col_idx, cell in enumerate(row):
+                # Check if cell looks like a number (contains digits or number-like chars)
+                is_number = bool(re.search(r'[\dOoIlSsZzGgBbОоЗз]', cell))
+                
+                # Clean text (conservative - preserve content)
+                cleaned_cell = self.post_process_text(
+                    cell, 
+                    is_number_column=is_number,
+                    aggressive_filter=False  # Conservative by default
+                )
+                
+                # If it's a number column and we extracted a clean number, prefer it
+                if is_number and cleaned_cell:
+                    number = self.extract_numbers_only(cleaned_cell)
+                    if number and len(number) >= 1:  # If we found a valid number
+                        cleaned_cell = number
+                    # Otherwise keep the cleaned text (might have text + numbers)
+                
                 processed_row.append(cleaned_cell)
             
+            # Keep row if it has any content (even if some cells are empty)
             padded_row = processed_row + [''] * (max_cols - len(processed_row))
             padded_data.append(padded_row)
         
@@ -512,29 +683,29 @@ class ImageToSheetConverter:
             for val in df[col]:
                 if pd.notna(val) and str(val).strip():
                     total_count += 1
-                    # Check if it's a number (after cleaning)
-                    cleaned = self.extract_and_validate_numbers(str(val))
-                    if re.match(r'^[\d\.\,\/\-]+$', cleaned.replace(' ', '')):
+                    # Try to extract number
+                    number = self.extract_numbers_only(str(val))
+                    if number:
                         numeric_count += 1
             
-            # If more than 50% are numbers, try to convert
-            if total_count > 0 and numeric_count / total_count > 0.5:
+            # If more than 40% are numbers, try to convert
+            if total_count > 0 and numeric_count / total_count > 0.4:
                 # Try to convert to numeric
                 for idx in df.index:
                     val = df.at[idx, col]
                     if pd.notna(val) and str(val).strip():
-                        cleaned = self.extract_and_validate_numbers(str(val))
-                        # Remove spaces and try to parse
-                        cleaned = cleaned.replace(' ', '').replace(',', '.')
-                        try:
-                            # Try to convert to float or int
-                            if '.' in cleaned or '/' in cleaned:
-                                num_val = float(cleaned.split('/')[0]) if '/' in cleaned else float(cleaned)
-                            else:
-                                num_val = int(cleaned)
-                            df.at[idx, col] = num_val
-                        except (ValueError, AttributeError):
-                            pass  # Keep original if conversion fails
+                        number = self.extract_numbers_only(str(val))
+                        if number:
+                            try:
+                                # Clean and parse
+                                cleaned = number.replace(',', '.')
+                                if '.' in cleaned:
+                                    num_val = float(cleaned)
+                                else:
+                                    num_val = int(cleaned)
+                                df.at[idx, col] = num_val
+                            except (ValueError, AttributeError):
+                                pass  # Keep original if conversion fails
         
         return df
     
@@ -545,7 +716,8 @@ class ImageToSheetConverter:
         format: str = 'xlsx',
         preprocess: bool = True,
         min_confidence: float = 0.2,
-        handwritten: bool = True
+        handwritten: bool = True,
+        aggressive_filter: bool = False  # Default to conservative filtering
     ) -> str:
         """
         Convert image to spreadsheet file.
@@ -651,6 +823,11 @@ def main():
         action='store_true',
         help='Use printed text optimization instead of handwritten (may improve speed)'
     )
+    parser.add_argument(
+        '--aggressive-filter',
+        action='store_true',
+        help='Use aggressive filtering to remove OCR errors and gibberish (recommended for handwritten text)'
+    )
     
     args = parser.parse_args()
     
@@ -663,7 +840,8 @@ def main():
             format=args.format,
             preprocess=not args.no_preprocess,
             min_confidence=args.min_confidence,
-            handwritten=not args.printed
+            handwritten=not args.printed,
+            aggressive_filter=args.aggressive_filter if hasattr(args, 'aggressive_filter') else False
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
